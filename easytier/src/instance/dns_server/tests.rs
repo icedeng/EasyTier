@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cidr::Ipv4Inet;
-use hickory_client::client::{Client, ClientHandle as _};
 use hickory_proto::rr;
-use hickory_proto::runtime::TokioRuntimeProvider;
-use hickory_proto::udp::UdpClientStream;
+use hickory_resolver::Resolver;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -66,55 +66,42 @@ pub async fn prepare_env_with_tld_dns_zone(
 }
 
 pub async fn check_dns_record(fake_ip: &Ipv4Addr, domain: &str, expected_ip: &str) {
-    let stream = UdpClientStream::builder(
-        SocketAddr::new((*fake_ip).into(), 53),
-        TokioRuntimeProvider::default(),
-    )
-    .build();
-    let (mut client, background) = Client::connect(stream).await.unwrap();
-    let background_task = tokio::spawn(background);
-    let response = client
-        .query(
-            rr::Name::from_str(domain).unwrap(),
-            rr::DNSClass::IN,
-            rr::RecordType::A,
-        )
+    let resolver = test_resolver(SocketAddr::new((*fake_ip).into(), 53));
+    let response = resolver
+        .lookup(rr::Name::from_str(domain).unwrap(), rr::RecordType::A)
         .await
         .unwrap_or_else(|e| panic!("DNS query failed unexpectedly for domain '{domain}': {e}"));
-    background_task.abort();
-    let _ = background_task.await;
 
     println!("Response: {:?}", response);
 
     assert_eq!(response.answers().len(), 1, "{:?}", response.answers());
     let resp = response.answers().first().unwrap();
-    assert_eq!(
-        resp.clone().into_parts().rdata.into_a().unwrap().0,
-        expected_ip.parse::<Ipv4Addr>().unwrap()
-    );
+    let rr::RData::A(actual_ip) = &resp.data else {
+        panic!("expected A record, got {:?}", resp.data);
+    };
+    assert_eq!(actual_ip.0, expected_ip.parse::<Ipv4Addr>().unwrap());
 }
 
 pub async fn check_dns_record_missing(fake_ip: &Ipv4Addr, domain: &str) {
-    let stream = UdpClientStream::builder(
-        SocketAddr::new((*fake_ip).into(), 53),
-        TokioRuntimeProvider::default(),
-    )
-    .build();
-    let (mut client, background) = Client::connect(stream).await.unwrap();
-    let background_task = tokio::spawn(background);
-    let response = client
-        .query(
-            rr::Name::from_str(domain).unwrap(),
-            rr::DNSClass::IN,
-            rr::RecordType::A,
-        )
+    let resolver = test_resolver(SocketAddr::new((*fake_ip).into(), 53));
+    let response = resolver
+        .lookup(rr::Name::from_str(domain).unwrap(), rr::RecordType::A)
         .await
         .unwrap_or_else(|e| {
             panic!("DNS query for missing record failed unexpectedly for domain '{domain}': {e}")
         });
-    background_task.abort();
-    let _ = background_task.await;
     assert!(response.answers().is_empty(), "{:?}", response.answers());
+}
+
+fn test_resolver(addr: SocketAddr) -> Resolver<TokioRuntimeProvider> {
+    let mut name_server = NameServerConfig::udp(addr.ip());
+    name_server.connections[0].port = addr.port();
+    Resolver::builder_with_config(
+        ResolverConfig::from_parts(None, Vec::new(), vec![name_server]),
+        TokioRuntimeProvider::default(),
+    )
+    .build()
+    .unwrap()
 }
 
 #[tokio::test]

@@ -3,13 +3,13 @@ use hickory_proto::op::Edns;
 use hickory_proto::rr;
 use hickory_proto::rr::LowerName;
 use hickory_resolver::config::ResolverOpts;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::net::runtime::{Time, TokioRuntimeProvider, TokioTime};
 use hickory_resolver::system_conf::read_system_conf;
-use hickory_server::ServerFuture;
-use hickory_server::authority::{AuthorityObject, Catalog, ZoneType};
+use hickory_server::Server as HickoryServer;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
-use hickory_server::store::forwarder::ForwardConfig;
-use hickory_server::store::{forwarder::ForwardAuthority, in_memory::InMemoryAuthority};
+use hickory_server::store::forwarder::{ForwardConfig, ForwardZoneHandler};
+use hickory_server::store::in_memory::InMemoryZoneHandler;
+use hickory_server::zone_handler::{AxfrPolicy, Catalog, ZoneHandler, ZoneType};
 use std::io;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -24,7 +24,7 @@ use crate::common::dns::get_default_resolver_config;
 use super::config::{GeneralConfig, Record, RunConfig};
 
 pub struct Server {
-    server: ServerFuture<CatalogRequestHandler>,
+    server: HickoryServer<CatalogRequestHandler>,
     catalog: Arc<RwLock<Catalog>>,
     general_config: GeneralConfig,
     udp_local_addr: Option<SocketAddr>,
@@ -52,7 +52,7 @@ impl CatalogRequestHandler {
 
 #[async_trait::async_trait]
 impl RequestHandler for CatalogRequestHandler {
-    async fn handle_request<R: ResponseHandler>(
+    async fn handle_request<R: ResponseHandler, T: Time>(
         &self,
         request: &Request,
         response_handle: R,
@@ -60,14 +60,14 @@ impl RequestHandler for CatalogRequestHandler {
         self.catalog
             .read()
             .await
-            .handle_request(request, response_handle)
+            .handle_request::<R, T>(request, response_handle)
             .await
     }
 }
 
-pub fn build_authority(domain: &str, records: &[Record]) -> Result<InMemoryAuthority> {
+pub fn build_authority(domain: &str, records: &[Record]) -> Result<InMemoryZoneHandler> {
     let zone = rr::Name::from_str(domain)?;
-    let mut authority = InMemoryAuthority::empty(zone, ZoneType::Primary, false);
+    let mut authority = InMemoryZoneHandler::empty(zone, ZoneType::Primary, AxfrPolicy::Deny);
     for record in records.iter() {
         let r = record.try_into()?;
         authority.upsert_mut(r, 0);
@@ -96,19 +96,15 @@ impl Server {
                 .0
                 .name_servers()
                 .iter()
-                .filter(|&x| {
-                    !config
-                        .excluded_forward_nameservers()
-                        .contains(&x.socket_addr.ip())
-                })
+                .filter(|&x| !config.excluded_forward_nameservers().contains(&x.ip))
                 .cloned()
                 .collect::<Vec<_>>()
                 .into(),
             options: Some(system_conf.1),
         };
-        let auth = ForwardAuthority::builder_with_config(
+        let auth = ForwardZoneHandler::builder_with_config(
             forward_config,
-            TokioConnectionProvider::default(),
+            TokioRuntimeProvider::default(),
         )
         .build()
         .unwrap();
@@ -117,7 +113,7 @@ impl Server {
 
         let catalog = Arc::new(RwLock::new(catalog));
         let handler = CatalogRequestHandler::new(catalog.clone());
-        let server = ServerFuture::new(handler);
+        let server = HickoryServer::new(handler);
 
         Ok(Self {
             server,
@@ -187,7 +183,7 @@ impl Server {
                 .with_context(|| format!("DNS Server failed to bind TCP address {}", address))?;
             self.tcp_local_addr = Some(tcp_listener.local_addr()?);
             self.server
-                .register_listener(tcp_listener, Duration::from_secs(5));
+                .register_listener(tcp_listener, Duration::from_secs(5), 32);
         }
 
         if let Some(address) = self.general_config.listen_udp() {
@@ -203,11 +199,11 @@ impl Server {
         Ok(())
     }
 
-    pub async fn upsert(&self, name: LowerName, authority: Arc<dyn AuthorityObject>) {
+    pub async fn upsert(&self, name: LowerName, authority: Arc<dyn ZoneHandler>) {
         self.catalog.write().await.upsert(name, vec![authority]);
     }
 
-    pub async fn remove(&self, name: &LowerName) -> Option<Vec<Arc<dyn AuthorityObject>>> {
+    pub async fn remove(&self, name: &LowerName) -> Option<Vec<Arc<dyn ZoneHandler>>> {
         self.catalog.write().await.remove(name)
     }
 
@@ -217,11 +213,17 @@ impl Server {
         response_edns: Option<Edns>,
         response_handle: R,
     ) -> io::Result<ResponseInfo> {
-        self.catalog
+        Ok(self
+            .catalog
             .write()
             .await
-            .update(update, response_edns, response_handle)
-            .await
+            .update(
+                update,
+                response_edns.as_ref(),
+                TokioTime::current_time(),
+                response_handle,
+            )
+            .await)
     }
 
     pub async fn contains(&self, name: &LowerName) -> bool {
@@ -237,7 +239,12 @@ impl Server {
         self.catalog
             .read()
             .await
-            .lookup(request, response_edns, response_handle)
+            .lookup(
+                request,
+                response_edns.as_ref(),
+                TokioTime::current_time(),
+                response_handle,
+            )
             .await
     }
 
@@ -257,10 +264,10 @@ mod tests {
         GeneralConfigBuilder, RecordBuilder, RecordType, RunConfigBuilder,
     };
     use anyhow::Result;
-    use hickory_client::client::{Client, ClientHandle};
     use hickory_proto::rr;
-    use hickory_proto::runtime::TokioRuntimeProvider;
-    use hickory_proto::udp::UdpClientStream;
+    use hickory_resolver::Resolver;
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
     use maplit::hashmap;
     use std::time::Duration;
 
@@ -314,17 +321,16 @@ mod tests {
         server.run().await?;
 
         let local_addr = server.udp_local_addr().unwrap();
-        let stream = UdpClientStream::builder(local_addr, TokioRuntimeProvider::default()).build();
-        let (mut client, background) = Client::connect(stream).await?;
-        let background_task = tokio::spawn(background);
-        let response = client
-            .query(
-                rr::Name::from_str("www.et.internal")?,
-                rr::DNSClass::IN,
-                rr::RecordType::A,
-            )
+        let mut name_server = NameServerConfig::udp(local_addr.ip());
+        name_server.connections[0].port = local_addr.port();
+        let resolver = Resolver::builder_with_config(
+            ResolverConfig::from_parts(None, Vec::new(), vec![name_server]),
+            TokioRuntimeProvider::default(),
+        )
+        .build()?;
+        let response = resolver
+            .lookup(rr::Name::from_str("www.et.internal")?, rr::RecordType::A)
             .await?;
-        drop(background_task);
 
         println!("Response: {:?}", response);
 

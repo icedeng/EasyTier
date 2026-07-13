@@ -174,7 +174,13 @@ message RetainNetworkInstanceResponse {
 
 message CollectNetworkInfoRequest { repeated common.UUID inst_ids = 1; }
 
-message CollectNetworkInfoResponse { NetworkInstanceRunningInfoMap info = 1; }
+message CollectNetworkInfoResponse {
+  NetworkInstanceRunningInfoMap info = 1;
+  bool dashboard_configured = 2;
+  bool dashboard_connected = 3;
+  string dashboard_state = 4;
+  optional string dashboard_error = 5;
+}
 
 message ListNetworkInstanceRequest {}
 

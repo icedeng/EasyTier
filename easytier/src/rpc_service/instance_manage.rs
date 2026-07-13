@@ -201,6 +201,21 @@ impl WebClientService for InstanceManageRpcService {
         _: BaseController,
         req: RunNetworkInstanceRequest,
     ) -> Result<RunNetworkInstanceResponse, rpc_types::error::Error> {
+        if !self.hooks.allows_remote_mutations() {
+            let effective_id = req
+                .inst_id
+                .map(Into::<uuid::Uuid>::into)
+                .or_else(|| {
+                    req.config
+                        .as_ref()
+                        .and_then(|config| config.instance_id.as_deref())
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                })
+                .unwrap_or_else(uuid::Uuid::new_v4);
+            return Ok(RunNetworkInstanceResponse {
+                inst_id: Some(effective_id.into()),
+            });
+        }
         if req.config.is_none() {
             return Err(anyhow::anyhow!("config is required").into());
         }
@@ -339,6 +354,16 @@ impl WebClientService for InstanceManageRpcService {
         _: BaseController,
         req: RetainNetworkInstanceRequest,
     ) -> Result<RetainNetworkInstanceResponse, rpc_types::error::Error> {
+        if !self.hooks.allows_remote_mutations() {
+            return Ok(RetainNetworkInstanceResponse {
+                remain_inst_ids: self
+                    .manager
+                    .list_network_instance_ids()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            });
+        }
         let _mutation_guard = self.remote_mutation_lock.lock().await;
         if !self.hooks.manages_remote_config_instances() {
             let remain = self
@@ -415,7 +440,14 @@ impl WebClientService for InstanceManageRpcService {
                 ret.map.remove(&k);
             }
         }
-        Ok(CollectNetworkInfoResponse { info: Some(ret) })
+        let dashboard = self.manager.dashboard_runtime_snapshot();
+        Ok(CollectNetworkInfoResponse {
+            info: Some(ret),
+            dashboard_configured: dashboard.configured,
+            dashboard_connected: dashboard.connected,
+            dashboard_state: dashboard.state.to_string(),
+            dashboard_error: dashboard.error,
+        })
     }
 
     //   rpc ListNetworkInstance(ListNetworkInstanceRequest) returns (ListNetworkInstanceResponse) {}
@@ -440,6 +472,16 @@ impl WebClientService for InstanceManageRpcService {
         _: BaseController,
         req: DeleteNetworkInstanceRequest,
     ) -> Result<DeleteNetworkInstanceResponse, rpc_types::error::Error> {
+        if !self.hooks.allows_remote_mutations() {
+            return Ok(DeleteNetworkInstanceResponse {
+                remain_inst_ids: self
+                    .manager
+                    .list_network_instance_ids()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            });
+        }
         let _mutation_guard = self.remote_mutation_lock.lock().await;
         let inst_ids: HashSet<uuid::Uuid> = req.inst_ids.into_iter().map(Into::into).collect();
 
@@ -535,6 +577,12 @@ impl WebClientService for InstanceManageRpcService {
         _: BaseController,
         req: GetNetworkInstanceConfigRequest,
     ) -> Result<GetNetworkInstanceConfigResponse, rpc_types::error::Error> {
+        if !self.hooks.allows_remote_mutations() {
+            return Err(anyhow::anyhow!(
+                "raw network configuration is unavailable in monitor-only mode"
+            )
+            .into());
+        }
         let inst_id: uuid::Uuid = req
             .inst_id
             .ok_or_else(|| anyhow::anyhow!("instance id is required"))?
@@ -626,6 +674,15 @@ mod tests {
         readonly_on_post_remove: Mutex<Vec<PathBuf>>,
     }
 
+    struct MonitorOnlyHooks;
+
+    #[async_trait::async_trait]
+    impl WebClientHooks for MonitorOnlyHooks {
+        fn allows_remote_mutations(&self) -> bool {
+            false
+        }
+    }
+
     #[async_trait::async_trait]
     impl WebClientHooks for RecordingHooks {
         fn manages_remote_config_instances(&self) -> bool {
@@ -683,6 +740,104 @@ mod tests {
             set_file_readonly(path, false);
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[tokio::test]
+    async fn monitor_only_lifecycle_mutations_are_successful_noops() {
+        let manager = Arc::new(NetworkInstanceManager::new());
+        let service = InstanceManageRpcService::new(manager.clone(), Arc::new(MonitorOnlyHooks));
+        let existing_id = manager
+            .run_network_instance(
+                TomlConfigLoader::new_from_str("listeners = []").unwrap(),
+                false,
+                ConfigFileControl::STATIC_CONFIG,
+            )
+            .unwrap();
+        let requested_id = Uuid::new_v4();
+
+        let ignored_response = service
+            .run_network_instance(
+                BaseController::default(),
+                RunNetworkInstanceRequest {
+                    inst_id: Some(requested_id.into()),
+                    config: None,
+                    overwrite: true,
+                    source: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ignored_response.inst_id.map(Into::<Uuid>::into),
+            Some(requested_id)
+        );
+
+        let run_response = service
+            .run_network_instance(
+                BaseController::default(),
+                RunNetworkInstanceRequest {
+                    inst_id: Some(requested_id.into()),
+                    config: Some(NetworkConfig {
+                        networking_method: Some(NetworkingMethod::Standalone as i32),
+                        listener_urls: Vec::new(),
+                        ..Default::default()
+                    }),
+                    overwrite: true,
+                    source: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            run_response.inst_id.map(Into::<Uuid>::into),
+            Some(requested_id)
+        );
+
+        let retain_response = service
+            .retain_network_instance(
+                BaseController::default(),
+                RetainNetworkInstanceRequest { inst_ids: vec![] },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retain_response
+                .remain_inst_ids
+                .into_iter()
+                .map(Into::<Uuid>::into)
+                .collect::<HashSet<_>>(),
+            HashSet::from([existing_id])
+        );
+
+        let delete_response = service
+            .delete_network_instance(
+                BaseController::default(),
+                DeleteNetworkInstanceRequest {
+                    inst_ids: vec![existing_id.into()],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            delete_response
+                .remain_inst_ids
+                .into_iter()
+                .map(Into::<Uuid>::into)
+                .collect::<HashSet<_>>(),
+            HashSet::from([existing_id])
+        );
+        assert_eq!(manager.list_network_instance_ids(), vec![existing_id]);
+        assert!(
+            service
+                .get_network_instance_config(
+                    BaseController::default(),
+                    GetNetworkInstanceConfigRequest {
+                        inst_id: Some(existing_id.into()),
+                    },
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -1139,9 +1139,10 @@ mod tests {
     };
     #[cfg(not(target_os = "linux"))]
     use super::{ensure_public_ipv6_provider_supported, public_ipv6_provider_auto_detect_error};
+    #[cfg(target_os = "linux")]
+    use crate::common::error::Error;
     use crate::common::{
         config::{ConfigLoader, TomlConfigLoader},
-        error::Error,
         global_ctx::{GlobalCtx, GlobalCtxEvent},
     };
 

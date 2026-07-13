@@ -23,6 +23,10 @@ use uuid::Uuid;
 
 #[async_trait]
 pub trait WebClientHooks: Send + Sync {
+    fn allows_remote_mutations(&self) -> bool {
+        true
+    }
+
     fn manages_remote_config_instances(&self) -> bool {
         false
     }
@@ -41,6 +45,15 @@ pub trait WebClientHooks: Send + Sync {
 }
 
 pub struct DefaultHooks;
+
+pub struct MonitorOnlyHooks;
+
+#[async_trait]
+impl WebClientHooks for MonitorOnlyHooks {
+    fn allows_remote_mutations(&self) -> bool {
+        false
+    }
+}
 
 #[async_trait]
 impl WebClientHooks for DefaultHooks {}
@@ -133,15 +146,20 @@ impl WebClient {
         loop {
             let conn = match connector.connect().await {
                 Ok(conn) => conn,
-                Err(error) => {
+                Err(_) => {
+                    controller.mark_dashboard_failed("Dashboard connection failed");
                     let wait = 1;
-                    log::warn!(%error, "Failed to connect to the server, retrying in {} seconds...", wait);
+                    log::warn!(
+                        "Failed to connect to the server, retrying in {} seconds...",
+                        wait
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     continue;
                 }
             };
 
             connected.store(true, Ordering::Release);
+            controller.mark_dashboard_connected();
             log::info!("Successfully connected to {:?}", conn.info());
 
             let mut session = session::Session::new(conn, controller.clone());
@@ -168,10 +186,14 @@ impl WebClient {
 
                 let conn = match connector.connect().await {
                     Ok(conn) => conn,
-                    Err(error) => {
+                    Err(_) => {
                         connected.store(false, Ordering::Release);
+                        controller.mark_dashboard_failed("Dashboard secure reconnect failed");
                         let wait = 1;
-                        log::warn!(%error, "Failed to reconnect secure tunnel, retrying in {} seconds...", wait);
+                        log::warn!(
+                            "Failed to reconnect secure tunnel, retrying in {} seconds...",
+                            wait
+                        );
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                         continue;
                     }
@@ -179,10 +201,11 @@ impl WebClient {
 
                 let conn = match security::upgrade_client_tunnel(conn).await {
                     Ok(conn) => conn,
-                    Err(error) => {
+                    Err(_) => {
                         connected.store(false, Ordering::Release);
+                        controller.mark_dashboard_failed("Dashboard secure handshake failed");
                         let wait = 1;
-                        log::warn!(%error, "Noise handshake failed, retrying in {} seconds...", wait);
+                        log::warn!("Noise handshake failed, retrying in {} seconds...", wait);
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                         continue;
                     }
@@ -192,12 +215,14 @@ impl WebClient {
                 session.start_heartbeat().await;
                 session.wait().await;
                 connected.store(false, Ordering::Release);
+                controller.mark_dashboard_failed("Dashboard connection interrupted");
                 continue;
             }
 
             if support_encryption {
                 if secure_mode {
                     connected.store(false, Ordering::Release);
+                    controller.mark_dashboard_failed("Dashboard secure tunnel is unavailable");
                     let wait = 1;
                     log::warn!(
                         "secure-mode enabled but local build lacks aes-gcm support for web secure tunnel, retrying in {} seconds...",
@@ -214,6 +239,7 @@ impl WebClient {
 
             if secure_mode {
                 connected.store(false, Ordering::Release);
+                controller.mark_dashboard_failed("Dashboard does not support secure tunnel");
                 let wait = 1;
                 log::warn!(
                     "secure-mode enabled but server does not support encryption, retrying in {} seconds...",
@@ -226,6 +252,7 @@ impl WebClient {
             session.start_heartbeat().await;
             session.wait().await;
             connected.store(false, Ordering::Release);
+            controller.mark_dashboard_failed("Dashboard connection interrupted");
         }
     }
 
@@ -242,6 +269,7 @@ pub async fn run_web_client(
     manager: Arc<NetworkInstanceManager>,
     hooks: Option<Arc<dyn WebClientHooks>>,
 ) -> Result<WebClient> {
+    manager.configure_dashboard();
     let machine_id = resolve_machine_id(&machine_id_opts)
         .with_context(|| "failed to resolve machine id for web client")?;
     let config_server_url = match Url::parse(config_server_url_s) {
@@ -357,7 +385,7 @@ mod tests {
             },
             None,
             false,
-            manager,
+            manager.clone(),
             None,
         )
         .await
@@ -365,6 +393,11 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!client.is_connected());
+        let dashboard = manager.dashboard_runtime_snapshot();
+        assert!(dashboard.configured);
+        assert!(!dashboard.connected);
+        assert_eq!(dashboard.state, "RETRYING");
+        assert_eq!(manager.list_network_instance_ids().len(), 0);
         drop(client);
     }
 }

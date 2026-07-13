@@ -39,6 +39,10 @@ impl Controller {
         self.manager.list_network_instance_ids()
     }
 
+    pub fn supports_remote_config(&self) -> bool {
+        self.hooks.allows_remote_mutations()
+    }
+
     pub fn token(&self) -> String {
         self.token.clone()
     }
@@ -61,5 +65,13 @@ impl Controller {
 
     pub(super) fn notify_manager_stopping(&self) {
         self.manager.notify_stop_check();
+    }
+
+    pub(super) fn mark_dashboard_connected(&self) {
+        self.manager.mark_dashboard_connected();
+    }
+
+    pub(super) fn mark_dashboard_failed(&self, message: &'static str) {
+        self.manager.mark_dashboard_failed(message);
     }
 }

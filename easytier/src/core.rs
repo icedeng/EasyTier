@@ -94,6 +94,12 @@ struct Cli {
     )]
     config_server: Option<String>,
 
+    #[arg(long, conflicts_with = "config_server", hide = true)]
+    config_server_file: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    web_client_monitor_only: bool,
+
     #[arg(
         long,
         env = "ET_MACHINE_ID",
@@ -786,6 +792,9 @@ struct RpcPortalOptions {
         help = t!("core_clap.rpc_portal_whitelist").to_string(),
     )]
     rpc_portal_whitelist: Option<Vec<IpCidr>>,
+
+    #[arg(long, help = "read the local RPC access token from a protected file")]
+    rpc_access_token_file: Option<PathBuf>,
 }
 
 impl Cli {
@@ -1349,21 +1358,35 @@ fn win_service_main(arg: Vec<std::ffi::OsString>) {
     win_service_event_loop(stop_notify_recv, cli, status_handle);
 }
 
-async fn run_main(cli: Cli) -> anyhow::Result<()> {
+async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
     defer!(dump_profile(0););
     log::init(&cli.logging_options, true)?;
+
+    if let Some(config_server_file) = cli.config_server_file.as_ref() {
+        let config_server = std::fs::read_to_string(config_server_file)
+            .context("failed to read config server file")?;
+        let config_server = config_server.trim();
+        if config_server.is_empty() {
+            return Err(anyhow::anyhow!("config server file is empty"));
+        }
+        cli.config_server = Some(config_server.to_string());
+    }
 
     let manager = Arc::new(NetworkInstanceManager::new().with_config_path(cli.config_dir.clone()));
 
     let _rpc_server = ApiRpcServer::new(
         cli.rpc_portal_options.rpc_portal,
         cli.rpc_portal_options.rpc_portal_whitelist,
+        cli.rpc_portal_options.rpc_access_token_file,
         manager.clone(),
     )?
     .serve()
     .await?;
 
     let _web_client = if let Some(config_server_url_s) = cli.config_server.as_ref() {
+        let hooks = cli
+            .web_client_monitor_only
+            .then(|| Arc::new(web_client::MonitorOnlyHooks) as Arc<dyn web_client::WebClientHooks>);
         let wc = web_client::run_web_client(
             config_server_url_s,
             crate::common::MachineIdOptions {
@@ -1373,19 +1396,22 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             cli.network_options.hostname.clone(),
             cli.network_options.secure_mode.unwrap_or(false),
             manager.clone(),
-            None,
+            hooks,
         )
-        .await
-        .inspect(|_| {
-            log::info!(
-                server = config_server_url_s,
-                "Web client started successfully...",
-            );
+        .await;
 
-            log::info!("Official config website: https://easytier.cn/web");
-        })?;
-
-        Some(wc)
+        match wc {
+            Ok(wc) => {
+                log::info!("Web client started successfully...");
+                log::info!("Official config website: https://easytier.cn/web");
+                Some(wc)
+            }
+            Err(_) => {
+                manager.mark_dashboard_failed("Dashboard client initialization failed");
+                log::warn!("Dashboard client initialization failed; data plane will continue");
+                None
+            }
+        }
     } else {
         None
     };

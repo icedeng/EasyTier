@@ -2,7 +2,14 @@
 use crate::launcher::{DataPlaneTcpListener, DataPlaneTcpStream, DataPlaneUdpSocket};
 use dashmap::DashMap;
 use std::fmt::{Display, Formatter};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::{
@@ -20,6 +27,66 @@ pub(crate) struct DaemonGuard {
     guard: Option<Arc<()>>,
     stop_check_notifier: Arc<tokio::sync::Notify>,
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DashboardRuntimeSnapshot {
+    pub configured: bool,
+    pub connected: bool,
+    pub state: &'static str,
+    pub error: Option<String>,
+}
+
+#[derive(Default)]
+struct DashboardRuntimeState {
+    configured: AtomicBool,
+    connected: AtomicBool,
+    error: RwLock<Option<String>>,
+}
+
+impl DashboardRuntimeState {
+    fn snapshot(&self) -> DashboardRuntimeSnapshot {
+        let configured = self.configured.load(Ordering::Acquire);
+        let connected = self.connected.load(Ordering::Acquire);
+        let error = self.error.read().ok().and_then(|value| value.clone());
+        let state = if !configured {
+            "DISABLED"
+        } else if connected {
+            "CONNECTED"
+        } else if error.is_some() {
+            "RETRYING"
+        } else {
+            "CONNECTING"
+        };
+        DashboardRuntimeSnapshot {
+            configured,
+            connected,
+            state,
+            error,
+        }
+    }
+
+    fn configure(&self) {
+        self.configured.store(true, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        if let Ok(mut error) = self.error.write() {
+            *error = None;
+        }
+    }
+
+    fn connected(&self) {
+        self.connected.store(true, Ordering::Release);
+        if let Ok(mut error) = self.error.write() {
+            *error = None;
+        }
+    }
+
+    fn failed(&self, message: &'static str) {
+        self.connected.store(false, Ordering::Release);
+        if let Ok(mut error) = self.error.write() {
+            *error = Some(message.to_string());
+        }
+    }
+}
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         drop(self.guard.take());
@@ -35,6 +102,7 @@ pub struct NetworkInstanceManager {
     config_dir: Option<PathBuf>,
     guard_counter: Arc<()>,
     remote_mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    dashboard_runtime: Arc<DashboardRuntimeState>,
 }
 
 impl Default for NetworkInstanceManager {
@@ -53,6 +121,7 @@ impl NetworkInstanceManager {
             config_dir: None,
             guard_counter: Arc::new(()),
             remote_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            dashboard_runtime: Arc::new(DashboardRuntimeState::default()),
         }
     }
 
@@ -63,6 +132,22 @@ impl NetworkInstanceManager {
 
     pub fn remote_mutation_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
         self.remote_mutation_lock.clone()
+    }
+
+    pub(crate) fn configure_dashboard(&self) {
+        self.dashboard_runtime.configure();
+    }
+
+    pub(crate) fn mark_dashboard_connected(&self) {
+        self.dashboard_runtime.connected();
+    }
+
+    pub(crate) fn mark_dashboard_failed(&self, message: &'static str) {
+        self.dashboard_runtime.failed(message);
+    }
+
+    pub fn dashboard_runtime_snapshot(&self) -> DashboardRuntimeSnapshot {
+        self.dashboard_runtime.snapshot()
     }
 
     fn start_instance_task(&self, instance_id: uuid::Uuid) -> Result<(), anyhow::Error> {
@@ -844,5 +929,29 @@ mod tests {
                 assert_eq!(manager.list_network_instance_ids().len(), 2);
             }
         }
+    }
+
+    #[test]
+    fn dashboard_failure_is_reported_without_changing_instance_state() {
+        let manager = NetworkInstanceManager::new();
+        assert_eq!(manager.dashboard_runtime_snapshot().state, "DISABLED");
+
+        manager.configure_dashboard();
+        assert_eq!(manager.dashboard_runtime_snapshot().state, "CONNECTING");
+
+        manager.mark_dashboard_failed("Dashboard connection failed");
+        let retrying = manager.dashboard_runtime_snapshot();
+        assert_eq!(retrying.state, "RETRYING");
+        assert!(!retrying.connected);
+        assert_eq!(
+            retrying.error.as_deref(),
+            Some("Dashboard connection failed")
+        );
+
+        manager.mark_dashboard_connected();
+        let connected = manager.dashboard_runtime_snapshot();
+        assert_eq!(connected.state, "CONNECTED");
+        assert!(connected.connected);
+        assert!(connected.error.is_none());
     }
 }
