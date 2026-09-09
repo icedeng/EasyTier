@@ -5,21 +5,21 @@ pub mod storage;
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
 use dashmap::DashMap;
-use easytier::{
-    proto::{
-        api::manage::WebClientService, rpc_types::controller::BaseController, web::HeartbeatRequest,
-    },
-    rpc_service::remote_client::{self, RemoteClientManager},
-    tunnel::TunnelListener,
-    web_client::security,
+use easytier::proto::{
+    api::manage::WebClientService, rpc_types::controller::BaseController, web::HeartbeatRequest,
+};
+use easytier_core::{
+    management::remote_client::{self, RemoteClientManager},
+    socket::SocketListener,
+    tunnel::{Tunnel, web_security},
 };
 use maxminddb::geoip2;
-use session::{Location, Session};
+use session::{Location, ManagedConfigRevisionDelta, Session};
 use storage::{Storage, StorageToken};
 
 use crate::FeatureFlags;
@@ -28,14 +28,12 @@ use tokio::task::JoinSet;
 
 use crate::db::{Db, UserIdInDb, entity::user_running_network_configs};
 
+pub(crate) use managed_config::ManagedConfigError;
+
 #[derive(rust_embed::Embed)]
 #[folder = "resources/"]
 #[include = "geoip2-cn.mmdb"]
 struct GeoipDb;
-
-pub fn is_managed_config_revision_conflict(error: &anyhow::Error) -> bool {
-    managed_config::is_revision_conflict(error)
-}
 
 fn load_geoip_db(geoip_db: Option<String>) -> Option<maxminddb::Reader<Vec<u8>>> {
     if let Some(path) = geoip_db {
@@ -62,6 +60,7 @@ pub struct ClientManager {
     tasks: JoinSet<()>,
 
     listeners_cnt: Arc<AtomicU32>,
+    next_session_epoch: Arc<AtomicU64>,
 
     client_sessions: Arc<DashMap<url::Url, Arc<Session>>>,
     storage: Storage,
@@ -94,6 +93,7 @@ impl ClientManager {
             tasks,
 
             listeners_cnt: Arc::new(AtomicU32::new(0)),
+            next_session_epoch: Arc::new(AtomicU64::new(0)),
 
             client_sessions,
             storage: Storage::new(db),
@@ -105,22 +105,28 @@ impl ClientManager {
         }
     }
 
-    pub async fn add_listener<L: TunnelListener + 'static>(
+    pub async fn add_listener<L: SocketListener<Accepted = Box<dyn Tunnel>> + 'static>(
         &mut self,
         mut listener: L,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<url::Url, anyhow::Error> {
         listener.listen().await?;
+        let local_url = listener.local_url();
         self.listeners_cnt.fetch_add(1, Ordering::Relaxed);
         let sessions = self.client_sessions.clone();
         let storage = self.storage.weak_ref();
         let listeners_cnt = self.listeners_cnt.clone();
+        let next_session_epoch = self.next_session_epoch.clone();
         let geoip_db = self.geoip_db.clone();
         let heartbeat_min_response_delay = self.heartbeat_min_response_delay;
         let feature_flags = self.feature_flags.clone();
         let webhook_config = self.webhook_config.clone();
         self.tasks.spawn(async move {
             while let Ok(tunnel) = listener.accept().await {
-                let (tunnel, secure) = match security::accept_or_upgrade_server_tunnel(tunnel).await {
+                let (tunnel, secure) = match web_security::accept_or_upgrade_server_tunnel(
+                    tunnel,
+                )
+                .await
+                {
                     Ok(v) => v,
                     Err(error) => {
                         tracing::warn!(%error, "failed to accept secure tunnel, dropping connection");
@@ -143,14 +149,17 @@ impl ClientManager {
                     heartbeat_min_response_delay,
                     feature_flags.clone(),
                     webhook_config.clone(),
+                    next_session_epoch.fetch_add(1, Ordering::Relaxed) + 1,
                 );
                 session.serve(tunnel).await;
-                sessions.insert(client_url, Arc::new(session));
+                let session = Arc::new(session);
+                sessions.insert(client_url, session.clone());
+                session.mark_route_ready();
             }
             listeners_cnt.fetch_sub(1, Ordering::Relaxed);
         });
 
-        Ok(())
+        Ok(local_url)
     }
 
     pub fn is_running(&self) -> bool {
@@ -217,7 +226,7 @@ impl ClientManager {
             Some("") => managed_config::ExpectedConfigRevision::Exact(None),
             Some(revision) => managed_config::ExpectedConfigRevision::Exact(Some(revision)),
         };
-        managed_config::reconcile_web_source_configs(
+        let status = managed_config::reconcile_web_source_configs(
             &self.storage,
             user_id,
             machine_id,
@@ -226,14 +235,78 @@ impl ClientManager {
             expected_config_revision,
         )
         .await?;
-        if let Some(config_revision) = config_revision
+        if matches!(
+            status,
+            managed_config::ManagedConfigApplyStatus::Applied { .. }
+        ) && let Some(config_revision) = config_revision
             && let Some(session) = self.get_session_by_machine_id(user_id, &machine_id)
         {
             session
-                .notify_config_revision_changed(user_id, machine_id, config_revision)
+                .notify_full_config_revision_changed(user_id, machine_id, config_revision)
                 .await;
         }
         Ok(())
+    }
+
+    pub async fn patch_managed_network_configs(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+        upserts: Vec<ManagedNetworkConfig>,
+        delete_instance_ids: Vec<uuid::Uuid>,
+        config_revision: String,
+        expected_config_revision: String,
+    ) -> anyhow::Result<()> {
+        let config_revision = config_revision.trim().to_string();
+        let expected_config_revision = expected_config_revision.trim().to_string();
+        let upsert_instance_ids = upserts
+            .iter()
+            .map(|config| config.instance_id.clone())
+            .collect();
+        let status = managed_config::patch_web_source_configs(
+            &self.storage,
+            user_id,
+            machine_id,
+            upserts,
+            delete_instance_ids,
+            &config_revision,
+            &expected_config_revision,
+        )
+        .await?;
+        if let managed_config::ManagedConfigApplyStatus::Applied {
+            deleted_web_instance_ids,
+        } = status
+            && let Some(session) = self.get_session_by_machine_id(user_id, &machine_id)
+        {
+            session
+                .notify_patch_config_revision_changed(
+                    user_id,
+                    machine_id,
+                    ManagedConfigRevisionDelta {
+                        expected_revision: expected_config_revision,
+                        target_revision: config_revision,
+                        upsert_instance_ids,
+                        delete_instance_ids: deleted_web_instance_ids
+                            .into_iter()
+                            .map(|instance_id| instance_id.to_string())
+                            .collect(),
+                    },
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    pub async fn invalidate_applied_config_revision(
+        &self,
+        user_id: UserIdInDb,
+        machine_id: uuid::Uuid,
+    ) {
+        if let Some(session) = self.get_session_by_machine_id(user_id, &machine_id) {
+            session
+                .invalidate_applied_config_revision(user_id, machine_id)
+                .await;
+        }
     }
 
     pub async fn get_heartbeat_requests(&self, client_url: &url::Url) -> Option<HeartbeatRequest> {
@@ -369,6 +442,7 @@ impl
 mod tests {
     use std::{
         collections::VecDeque,
+        future::Future,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -378,22 +452,26 @@ mod tests {
 
     use axum::{Json, Router, extract::State, routing::post};
     use easytier::{
-        common::MachineIdOptions,
-        instance_manager::NetworkInstanceManager,
+        common::{
+            MachineIdOptions,
+            config::{ConfigSource, NetworkConfigExt},
+        },
+        instance::factory::{
+            NativeInstanceManager, native_compact_instance_manager_with_runtime,
+            native_instance_manager,
+        },
         proto::{
             api::manage::{NetworkConfig, NetworkingMethod, PortForwardConfig},
             common::CompressionAlgoPb,
-        },
-        rpc_service::remote_client::Storage as RemoteStorage,
-        tunnel::{
-            common::tests::wait_for_condition,
-            udp::{UdpTunnelConnector, UdpTunnelListener},
+            rpc::standalone::{runtime_udp_tunnel_dialer, runtime_udp_tunnel_listener},
         },
         web_client::{WebClient, run_web_client},
     };
+    use easytier_core::management::remote_client::{
+        RemoteClientManager as _, Storage as RemoteStorage,
+    };
     use serde_json::json;
     use sqlx::Executor;
-    use tokio::net::UdpSocket;
 
     use crate::{
         FeatureFlags, client_manager::ClientManager, db::Db, webhook::ManagedNetworkConfig,
@@ -401,12 +479,30 @@ mod tests {
 
     const MANAGED_CONFIG_TOKEN: &str = "managed-config-token";
 
+    async fn wait_for_condition<F, Fut>(mut condition: F, timeout: Duration)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !condition().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "condition timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct TestWebhookState {
         validate_responses: Arc<tokio::sync::Mutex<VecDeque<bool>>>,
         validate_count: Arc<AtomicUsize>,
         block_second_validate: Arc<AtomicBool>,
         allow_second_validate: Arc<AtomicBool>,
+        connected_count: Arc<AtomicUsize>,
+        block_connected: Arc<AtomicBool>,
+        allow_connected: Arc<AtomicBool>,
     }
 
     impl TestWebhookState {
@@ -418,6 +514,9 @@ mod tests {
                 validate_count: Arc::new(AtomicUsize::new(0)),
                 block_second_validate: Arc::new(AtomicBool::new(false)),
                 allow_second_validate: Arc::new(AtomicBool::new(true)),
+                connected_count: Arc::new(AtomicUsize::new(0)),
+                block_connected: Arc::new(AtomicBool::new(false)),
+                allow_connected: Arc::new(AtomicBool::new(true)),
             }
         }
 
@@ -430,12 +529,27 @@ mod tests {
             state
         }
 
+        fn with_blocked_connected(validate_responses: impl IntoIterator<Item = bool>) -> Self {
+            let state = Self::new(validate_responses);
+            state.block_connected.store(true, Ordering::Release);
+            state.allow_connected.store(false, Ordering::Release);
+            state
+        }
+
         fn allow_second_validate(&self) {
             self.allow_second_validate.store(true, Ordering::Release);
         }
 
         fn validate_count(&self) -> usize {
             self.validate_count.load(Ordering::Acquire)
+        }
+
+        fn allow_connected(&self) {
+            self.allow_connected.store(true, Ordering::Release);
+        }
+
+        fn connected_count(&self) -> usize {
+            self.connected_count.load(Ordering::Acquire)
         }
     }
 
@@ -469,6 +583,18 @@ mod tests {
         Json(json!({}))
     }
 
+    async fn node_connected_handler(
+        State(state): State<TestWebhookState>,
+    ) -> Json<serde_json::Value> {
+        state.connected_count.fetch_add(1, Ordering::AcqRel);
+        while state.block_connected.load(Ordering::Acquire)
+            && !state.allow_connected.load(Ordering::Acquire)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Json(json!({}))
+    }
+
     async fn test_webhook_config() -> (
         crate::webhook::SharedWebhookConfig,
         tokio::task::JoinHandle<()>,
@@ -487,7 +613,7 @@ mod tests {
     ) {
         let app = Router::new()
             .route("/validate-token", post(validate_token_handler))
-            .route("/webhook/node-connected", post(webhook_ack_handler))
+            .route("/webhook/node-connected", post(node_connected_handler))
             .route("/webhook/node-disconnected", post(webhook_ack_handler))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -510,12 +636,51 @@ mod tests {
     }
 
     async fn add_random_udp_listener(mgr: &mut ClientManager) -> std::net::SocketAddr {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let addr = socket.local_addr().unwrap();
-        let listener =
-            UdpTunnelListener::new_with_socket(format!("udp://{addr}").parse().unwrap(), socket);
-        mgr.add_listener(listener).await.unwrap();
-        addr
+        let local_url = "udp://127.0.0.1:0".parse().unwrap();
+        let listener = runtime_udp_tunnel_listener(local_url, "127.0.0.1:0".parse().unwrap());
+        let local_url = mgr.add_listener(listener).await.unwrap();
+        local_url
+            .socket_addrs(|| None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connected_webhook_observes_a_routable_current_session() {
+        let webhook_state = TestWebhookState::with_blocked_connected([true]);
+        let (webhook_config, webhook_server, webhook_state) =
+            test_webhook_config_with_state(webhook_state).await;
+        let mut mgr = ClientManager::new(
+            Db::memory_db().await,
+            None,
+            Duration::ZERO,
+            Arc::new(FeatureFlags::default()),
+            webhook_config,
+        );
+        let config_server_addr = add_random_udp_listener(&mut mgr).await;
+        let machine_id = uuid::Uuid::new_v4();
+        let _client = start_web_client_for_test(
+            config_server_addr,
+            machine_id,
+            Arc::new(native_instance_manager()),
+        )
+        .await;
+
+        wait_for_condition(
+            || async { webhook_state.connected_count() == 1 },
+            Duration::from_secs(12),
+        )
+        .await;
+        let user_id = wait_for_validated_user(&mgr, machine_id).await;
+        let session = mgr
+            .get_session_by_machine_id(user_id, &machine_id)
+            .expect("connected target must already resolve to a session");
+        assert!(session.is_running());
+
+        webhook_state.allow_connected();
+        webhook_server.abort();
     }
 
     async fn wait_for_validated_user(mgr: &ClientManager, machine_id: uuid::Uuid) -> i32 {
@@ -575,14 +740,14 @@ mod tests {
     }
 
     async fn wait_for_runtime_config(
-        manager: &NetworkInstanceManager,
+        manager: &NativeInstanceManager,
         inst_id: uuid::Uuid,
         predicate: impl Fn(&NetworkConfig) -> bool,
     ) -> NetworkConfig {
         tokio::time::timeout(Duration::from_secs(12), async {
             loop {
                 if let Some(config) = manager
-                    .get_instance_config(&inst_id)
+                    .config(inst_id)
                     .and_then(|config| NetworkConfig::new_from_config(&config).ok())
                     .filter(|config| predicate(config))
                 {
@@ -595,10 +760,33 @@ mod tests {
         .unwrap()
     }
 
+    async fn wait_for_applied_revision(
+        manager: &ClientManager,
+        user_id: i32,
+        machine_id: uuid::Uuid,
+        revision: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let applied = manager
+                    .get_session_by_machine_id(user_id, &machine_id)
+                    .map(|session| async move { session.applied_config_revision().await });
+                if let Some(applied) = applied
+                    && applied.await.as_deref() == Some(revision)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     async fn start_web_client_for_test(
         config_server_addr: std::net::SocketAddr,
         machine_id: uuid::Uuid,
-        manager: Arc<NetworkInstanceManager>,
+        manager: Arc<NativeInstanceManager>,
     ) -> WebClient {
         run_web_client(
             &format!("udp://{config_server_addr}/{MANAGED_CONFIG_TOKEN}"),
@@ -813,7 +1001,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_client() {
-        let listener = UdpTunnelListener::new("udp://0.0.0.0:54333".parse().unwrap());
+        let listener = runtime_udp_tunnel_listener(
+            "udp://127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
         let mut mgr = ClientManager::new(
             Db::memory_db().await,
             None,
@@ -823,7 +1014,7 @@ mod tests {
                 None, None, None, None, None,
             )),
         );
-        mgr.add_listener(Box::new(listener)).await.unwrap();
+        let listener_url = mgr.add_listener(listener).await.unwrap();
 
         mgr.db()
             .inner()
@@ -831,14 +1022,14 @@ mod tests {
             .await
             .unwrap();
 
-        let connector = UdpTunnelConnector::new("udp://127.0.0.1:54333".parse().unwrap());
+        let connector = runtime_udp_tunnel_dialer(listener_url);
         let _c = WebClient::new(
             connector,
             "test",
             uuid::Uuid::new_v4(),
             "test",
             false,
-            Arc::new(NetworkInstanceManager::new()),
+            Arc::new(native_instance_manager()),
             None,
         );
 
@@ -879,6 +1070,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_runtime_preserves_unsupported_web_config_during_hot_patch() {
+        let (webhook_config, webhook_server, _) = test_webhook_config().await;
+        let mut mgr = ClientManager::new(
+            Db::memory_db().await,
+            None,
+            Duration::ZERO,
+            Arc::new(FeatureFlags::default()),
+            webhook_config,
+        );
+        let config_server_addr = add_random_udp_listener(&mut mgr).await;
+
+        let machine_id = uuid::Uuid::new_v4();
+        let instance_id = uuid::Uuid::new_v4();
+        let core_manager = Arc::new(native_compact_instance_manager_with_runtime(
+            tokio::runtime::Handle::current(),
+        ));
+        let _client =
+            start_web_client_for_test(config_server_addr, machine_id, core_manager.clone()).await;
+        let user_id = wait_for_validated_user(&mgr, machine_id).await;
+
+        let desired = updated_managed_network_config(instance_id);
+        let mut initial = desired.clone();
+        initial["port_forwards"] = json!([]);
+        mgr.reconcile_managed_network_configs(
+            user_id,
+            machine_id,
+            vec![managed_config(instance_id, initial)],
+            Some("compact-initial".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_runtime_config(&core_manager, instance_id, |config| {
+            config.network_name.as_deref() == Some("managed-updated")
+                && config.port_forwards.is_empty()
+        })
+        .await;
+
+        mgr.reconcile_managed_network_configs(
+            user_id,
+            machine_id,
+            vec![managed_config(instance_id, desired)],
+            Some("compact-patched".to_string()),
+            Some("compact-initial".to_string()),
+        )
+        .await
+        .unwrap();
+        let patched = wait_for_runtime_config(&core_manager, instance_id, |config| {
+            config.network_name.as_deref() == Some("managed-updated")
+                && config.port_forwards.len() == 1
+        })
+        .await;
+
+        assert_updated_runtime_config(&patched, instance_id);
+        assert_eq!(
+            mgr.db()
+                .get_managed_config_revision((user_id, machine_id))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("compact-patched")
+        );
+        webhook_server.abort();
+    }
+
+    #[tokio::test]
     async fn managed_web_config_revision_updates_running_core_config() {
         let (webhook_config, webhook_server, _) = test_webhook_config().await;
         let mut mgr = ClientManager::new(
@@ -892,7 +1149,7 @@ mod tests {
 
         let machine_id = uuid::Uuid::new_v4();
         let instance_id = uuid::Uuid::new_v4();
-        let core_manager = Arc::new(NetworkInstanceManager::new());
+        let core_manager = Arc::new(native_instance_manager());
         let client =
             start_web_client_for_test(config_server_addr, machine_id, core_manager.clone()).await;
 
@@ -914,6 +1171,33 @@ mod tests {
             config.network_name.as_deref() == Some("managed-initial")
         })
         .await;
+        wait_for_applied_revision(&mgr, user_id, machine_id, "rev-initial").await;
+
+        // Runtime-only mutations do not change SQLite. Invalidate the Session
+        // applied fence and verify the existing revision is fully reconciled
+        // before a later targeted Patch may rely on it as a base.
+        let mut drifted: NetworkConfig =
+            serde_json::from_value(initial_managed_network_config(instance_id)).unwrap();
+        drifted.network_name = Some("runtime-only-drift".to_string());
+        mgr.handle_run_network_instance_with_source(
+            (user_id, machine_id),
+            drifted,
+            false,
+            ConfigSource::Web,
+        )
+        .await
+        .unwrap();
+        wait_for_runtime_config(&core_manager, instance_id, |config| {
+            config.network_name.as_deref() == Some("runtime-only-drift")
+        })
+        .await;
+        mgr.invalidate_applied_config_revision(user_id, machine_id)
+            .await;
+        wait_for_runtime_config(&core_manager, instance_id, |config| {
+            config.network_name.as_deref() == Some("managed-initial")
+        })
+        .await;
+        wait_for_applied_revision(&mgr, user_id, machine_id, "rev-initial").await;
 
         // Online revision update: web-owned running config is fully overwritten
         // when non-hot-patch flags such as enable_kcp_proxy change.
@@ -939,7 +1223,7 @@ mod tests {
         assert_updated_runtime_config(&updated, instance_id);
 
         assert_eq!(
-            core_manager.get_instance_network_config_source(&instance_id),
+            core_manager.config_source(instance_id),
             Some(easytier::common::config::ConfigSource::Web)
         );
         assert_eq!(
@@ -1003,7 +1287,7 @@ mod tests {
         assert_eq!(redelivered.enable_kcp_proxy, Some(true));
         assert_eq!(redelivered.instance_recv_bps_limit, Some(654321));
         assert_eq!(
-            core_manager.get_instance_network_config_source(&instance_id),
+            core_manager.config_source(instance_id),
             Some(easytier::common::config::ConfigSource::Web)
         );
         assert_eq!(
@@ -1018,7 +1302,7 @@ mod tests {
         // Reconnect path: a fresh core manager has no local runtime state, so
         // the new session must replay the managed config persisted in web DB.
         drop(client);
-        let reconnected_core_manager = Arc::new(NetworkInstanceManager::new());
+        let reconnected_core_manager = Arc::new(native_instance_manager());
         let _reconnected_client = start_web_client_for_test(
             config_server_addr,
             machine_id,
@@ -1055,7 +1339,7 @@ mod tests {
         );
         let config_server_addr = add_random_udp_listener(&mut mgr).await;
         let machine_id = uuid::Uuid::new_v4();
-        let core_manager = Arc::new(NetworkInstanceManager::new());
+        let core_manager = Arc::new(native_instance_manager());
         let client =
             start_web_client_for_test(config_server_addr, machine_id, core_manager.clone()).await;
 

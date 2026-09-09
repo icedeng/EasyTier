@@ -2,97 +2,95 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use cidr::IpCidr;
+#[cfg(feature = "management")]
+use easytier_core::management::ManagementServer;
+use easytier_core::{management::ReadOnlyManagementServer, socket::SocketListener, tunnel::Tunnel};
 
+#[cfg(feature = "management")]
 use crate::{
-    instance::instance::InstanceRpcServerHook,
-    instance_manager::NetworkInstanceManager,
+    instance::config_storage::NativeConfigFileStorage, rpc_service::logger::NativeLoggerControl,
+    web_client::DefaultHooks,
+};
+use crate::{
+    instance::factory::NativeInstanceManager,
     proto::{
-        api::{
-            config::ConfigRpcServer,
-            instance::{
-                AclManageRpcServer, ConnectorManageRpcServer, CredentialManageRpcServer,
-                MappedListenerManageRpcServer, PeerManageRpcServer, PortForwardManageRpcServer,
-                StatsRpcServer, TcpProxyRpcServer, VpnPortalRpcServer,
-            },
-            logger::LoggerRpcServer,
-            manage::WebClientServiceServer,
-        },
-        peer_rpc::PeerCenterRpcServer,
-        rpc_impl::{service_registry::ServiceRegistry, standalone::StandAloneServer},
+        rpc::standalone::{RuntimeRpcListener, runtime_rpc_listener},
         rpc_types::error::Error,
     },
-    rpc_service::{
-        acl_manage::AclManageRpcService, config::ConfigRpcService,
-        connector_manage::ConnectorManageRpcService, credential_manage::CredentialManageRpcService,
-        instance_manage::InstanceManageRpcService, logger::LoggerRpcService,
-        mapped_listener_manage::MappedListenerManageRpcService,
-        peer_center::PeerCenterManageRpcService, peer_manage::PeerManageRpcService,
-        port_forward_manage::PortForwardManageRpcService, protected_port,
-        proxy::TcpProxyRpcService, stats::StatsRpcService, vpn_portal::VpnPortalRpcService,
-    },
-    tunnel::{TunnelListener, tcp::TcpTunnelListener},
-    web_client::{DefaultHooks, WebClientHooks},
 };
 
-pub struct ApiRpcServer<T: TunnelListener + 'static> {
-    rpc_server: StandAloneServer<T>,
-    protected_tcp_port: Option<u16>,
+#[cfg(feature = "management")]
+pub struct ApiRpcServer<T>
+where
+    T: SocketListener<Accepted = Box<dyn Tunnel>> + 'static,
+{
+    rpc_server: ManagementServer<T>,
 }
 
-impl ApiRpcServer<TcpTunnelListener> {
+#[cfg(feature = "management")]
+impl ApiRpcServer<RuntimeRpcListener> {
     pub fn new(
         rpc_portal: Option<String>,
         rpc_portal_whitelist: Option<Vec<IpCidr>>,
         rpc_access_token_file: Option<PathBuf>,
-        instance_manager: Arc<NetworkInstanceManager>,
+        instance_manager: Arc<NativeInstanceManager>,
     ) -> anyhow::Result<Self> {
         let rpc_addr = parse_rpc_portal(rpc_portal)?;
-        let rpc_access_token = load_rpc_access_token(rpc_access_token_file)?;
+        let token = load_rpc_access_token(rpc_access_token_file)?;
         let mut server = Self::from_tunnel_with_domain(
-            TcpTunnelListener::new(
-                format!("tcp://{}", rpc_addr)
-                    .parse()
-                    .context("failed to parse rpc portal address")?,
-            ),
+            runtime_rpc_listener(rpc_addr),
             instance_manager,
-            rpc_access_token.as_deref().unwrap_or_default(),
+            token.as_deref().unwrap_or_default(),
         );
-        protected_port::register_protected_tcp_port(rpc_addr.port());
-        server.protected_tcp_port = Some(rpc_addr.port());
-
-        server
-            .rpc_server
-            .set_hook(Arc::new(InstanceRpcServerHook::new(rpc_portal_whitelist)));
+        server.rpc_server.set_whitelist(rpc_portal_whitelist);
 
         Ok(server)
     }
 }
 
-impl<T: TunnelListener + 'static> ApiRpcServer<T> {
-    pub fn from_tunnel(tunnel: T, instance_manager: Arc<NetworkInstanceManager>) -> Self {
+#[cfg(feature = "management")]
+impl<T> ApiRpcServer<T>
+where
+    T: SocketListener<Accepted = Box<dyn Tunnel>> + 'static,
+{
+    pub fn from_tunnel(tunnel: T, instance_manager: Arc<NativeInstanceManager>) -> Self {
         Self::from_tunnel_with_domain(tunnel, instance_manager, "")
     }
 
     pub fn from_tunnel_with_domain(
         tunnel: T,
-        instance_manager: Arc<NetworkInstanceManager>,
+        instance_manager: Arc<NativeInstanceManager>,
         access_domain: &str,
     ) -> Self {
-        let rpc_server = StandAloneServer::new(tunnel);
-        register_api_rpc_service_with_domain(
-            &instance_manager,
-            rpc_server.registry(),
-            None,
+        let rpc_server = ManagementServer::new_with_domain(
+            tunnel,
+            instance_manager,
+            Arc::new(DefaultHooks),
+            Arc::new(NativeConfigFileStorage),
+            Arc::new(NativeLoggerControl),
             access_domain,
         );
-        Self {
-            rpc_server,
-            protected_tcp_port: None,
-        }
+        Self { rpc_server }
     }
 }
 
-impl<T: TunnelListener + 'static> ApiRpcServer<T> {
+fn load_rpc_access_token(path: Option<PathBuf>) -> anyhow::Result<Option<String>> {
+    let Some(path) = path else { return Ok(None); };
+    let token = std::fs::read_to_string(path)
+        .context("failed to read rpc access token file")?
+        .trim()
+        .to_owned();
+    if token.len() < 32 || token.len() > 128 || !token.bytes().all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_')) {
+        anyhow::bail!("rpc access token file contains an invalid token");
+    }
+    Ok(Some(token))
+}
+
+#[cfg(feature = "management")]
+impl<T> ApiRpcServer<T>
+where
+    T: SocketListener<Accepted = Box<dyn Tunnel>> + 'static,
+{
     pub async fn serve(mut self) -> Result<Self, Error> {
         self.rpc_server.serve().await?;
         Ok(self)
@@ -104,158 +102,60 @@ impl<T: TunnelListener + 'static> ApiRpcServer<T> {
     }
 }
 
-impl<T: TunnelListener + 'static> Drop for ApiRpcServer<T> {
-    fn drop(&mut self) {
-        if let Some(port) = self.protected_tcp_port.take() {
-            protected_port::unregister_protected_tcp_port(port);
+pub struct ReadOnlyApiRpcServer<T>
+where
+    T: SocketListener<Accepted = Box<dyn Tunnel>> + 'static,
+{
+    rpc_server: ReadOnlyManagementServer<T>,
+}
+
+impl ReadOnlyApiRpcServer<RuntimeRpcListener> {
+    pub fn new(
+        rpc_portal: Option<String>,
+        rpc_portal_whitelist: Option<Vec<IpCidr>>,
+        instance_manager: Arc<NativeInstanceManager>,
+    ) -> anyhow::Result<Self> {
+        let rpc_addr = parse_rpc_portal(rpc_portal)?;
+        let mut server = Self::from_tunnel(runtime_rpc_listener(rpc_addr), instance_manager);
+        server.rpc_server.set_whitelist(rpc_portal_whitelist);
+        Ok(server)
+    }
+}
+
+impl<T> ReadOnlyApiRpcServer<T>
+where
+    T: SocketListener<Accepted = Box<dyn Tunnel>> + 'static,
+{
+    pub fn from_tunnel(tunnel: T, instance_manager: Arc<NativeInstanceManager>) -> Self {
+        Self {
+            rpc_server: ReadOnlyManagementServer::new(tunnel, instance_manager),
         }
-        self.rpc_server.registry().unregister_all();
-    }
-}
-
-pub fn register_api_rpc_service(
-    instance_manager: &Arc<NetworkInstanceManager>,
-    registry: &ServiceRegistry,
-    hooks: Option<Arc<dyn WebClientHooks>>,
-) {
-    if hooks
-        .as_ref()
-        .is_some_and(|hooks| !hooks.allows_remote_mutations())
-    {
-        registry.register(
-            WebClientServiceServer::new(InstanceManageRpcService::new(
-                instance_manager.clone(),
-                hooks.expect("monitor-only hooks are present"),
-            )),
-            "",
-        );
-        return;
-    }
-    register_api_rpc_service_with_domain(instance_manager, registry, hooks, "");
-}
-
-fn register_api_rpc_service_with_domain(
-    instance_manager: &Arc<NetworkInstanceManager>,
-    registry: &ServiceRegistry,
-    hooks: Option<Arc<dyn WebClientHooks>>,
-    access_domain: &str,
-) {
-    registry.register(
-        PeerManageRpcServer::new(PeerManageRpcService::new(instance_manager.clone())),
-        &rpc_domain(access_domain, ""),
-    );
-
-    registry.register(
-        ConnectorManageRpcServer::new(ConnectorManageRpcService::new(instance_manager.clone())),
-        &rpc_domain(access_domain, ""),
-    );
-
-    registry.register(
-        MappedListenerManageRpcServer::new(MappedListenerManageRpcService::new(
-            instance_manager.clone(),
-        )),
-        &rpc_domain(access_domain, ""),
-    );
-
-    registry.register(
-        VpnPortalRpcServer::new(VpnPortalRpcService::new(instance_manager.clone())),
-        &rpc_domain(access_domain, ""),
-    );
-
-    for client_type in ["tcp", "kcp_src", "kcp_dst", "quic_src", "quic_dst"] {
-        registry.register(
-            TcpProxyRpcServer::new(TcpProxyRpcService::new(
-                instance_manager.clone(),
-                client_type,
-            )),
-            &rpc_domain(access_domain, client_type),
-        );
     }
 
-    registry.register(
-        AclManageRpcServer::new(AclManageRpcService::new(instance_manager.clone())),
-        &rpc_domain(access_domain, ""),
-    );
-
-    registry.register(
-        PortForwardManageRpcServer::new(PortForwardManageRpcService::new(instance_manager.clone())),
-        &rpc_domain(access_domain, ""),
-    );
-
-    registry.register(
-        StatsRpcServer::new(StatsRpcService::new(instance_manager.clone())),
-        &rpc_domain(access_domain, ""),
-    );
-
-    registry.register(
-        LoggerRpcServer::new(LoggerRpcService),
-        &rpc_domain(access_domain, ""),
-    );
-
-    registry.register(
-        ConfigRpcServer::new(ConfigRpcService::new(instance_manager.clone())),
-        &rpc_domain(access_domain, ""),
-    );
-
-    registry.register(
-        WebClientServiceServer::new(InstanceManageRpcService::new(
-            instance_manager.clone(),
-            hooks.unwrap_or(Arc::new(DefaultHooks)),
-        )),
-        &rpc_domain(access_domain, ""),
-    );
-
-    registry.register(
-        PeerCenterRpcServer::new(PeerCenterManageRpcService::new(instance_manager.clone())),
-        &rpc_domain(access_domain, ""),
-    );
-
-    registry.register(
-        CredentialManageRpcServer::new(CredentialManageRpcService::new(instance_manager.clone())),
-        &rpc_domain(access_domain, ""),
-    );
-}
-
-fn rpc_domain(access_domain: &str, service_domain: &str) -> String {
-    match (access_domain.is_empty(), service_domain.is_empty()) {
-        (true, _) => service_domain.to_string(),
-        (false, true) => access_domain.to_string(),
-        (false, false) => format!("{access_domain}/{service_domain}"),
+    pub async fn serve(mut self) -> Result<Self, Error> {
+        self.rpc_server.serve().await?;
+        Ok(self)
     }
-}
 
-fn load_rpc_access_token(path: Option<PathBuf>) -> anyhow::Result<Option<String>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let token = std::fs::read_to_string(path)
-        .context("failed to read rpc access token file")?
-        .trim()
-        .to_string();
-    if token.len() < 32
-        || token.len() > 128
-        || !token
-            .bytes()
-            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
-    {
-        anyhow::bail!("rpc access token file contains an invalid token");
+    pub fn with_rx_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.rpc_server.set_rx_timeout(timeout);
+        self
     }
-    Ok(Some(token))
 }
 
 fn parse_rpc_portal(rpc_portal: Option<String>) -> anyhow::Result<SocketAddr> {
-    if let Some(Ok(port)) = rpc_portal.as_ref().map(|s| s.parse::<u16>()) {
-        Ok(SocketAddr::from(([0, 0, 0, 0], port)))
+    let mut rpc_addr = if let Some(Ok(port)) = rpc_portal.as_ref().map(|s| s.parse::<u16>()) {
+        Some(SocketAddr::from(([0, 0, 0, 0], port)))
     } else {
-        let mut rpc_addr = rpc_portal
+        rpc_portal
             .map(|addr| {
                 addr.parse::<SocketAddr>()
                     .context("failed to parse rpc portal address")
             })
-            .transpose()?;
-        select_proper_rpc_port(&mut rpc_addr)?;
-        rpc_addr.ok_or_else(|| anyhow::anyhow!("failed to parse rpc portal address"))
-    }
+            .transpose()?
+    };
+    select_proper_rpc_port(&mut rpc_addr)?;
+    rpc_addr.ok_or_else(|| anyhow::anyhow!("failed to parse rpc portal address"))
 }
 
 fn select_proper_rpc_port(addr: &mut Option<SocketAddr>) -> anyhow::Result<()> {
@@ -280,84 +180,89 @@ fn select_proper_rpc_port(addr: &mut Option<SocketAddr>) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "management"))]
 mod tests {
-    use super::*;
+    use std::{fmt, sync::Arc, time::Duration};
+
+    use easytier_core::{
+        rpc::bidirect::BidirectRpcManager,
+        socket::SocketListener,
+        tunnel::{Tunnel, ring::create_ring_tunnel_pair},
+    };
+    use tokio::sync::mpsc;
+
     use crate::{
+        instance::factory::native_instance_manager,
         proto::{
-            api::manage::{
-                CollectNetworkInfoRequest, WebClientService, WebClientServiceClientFactory,
-            },
-            rpc_impl::standalone::StandAloneClient,
+            api::logger::{GetLoggerConfigRequest, LoggerRpc, LoggerRpcClientFactory},
             rpc_types::controller::BaseController,
         },
-        tunnel::tcp::{TcpTunnelConnector, TcpTunnelListener},
     };
 
-    #[test]
-    fn access_token_namespaces_all_rpc_domains() {
-        assert_eq!(rpc_domain("token", ""), "token");
-        assert_eq!(rpc_domain("token", "tcp"), "token/tcp");
-        assert_eq!(rpc_domain("", "tcp"), "tcp");
-    }
+    use super::{ApiRpcServer, parse_rpc_portal};
 
     #[test]
-    fn rpc_access_token_file_rejects_short_token() {
-        let path =
-            std::env::temp_dir().join(format!("easytier-rpc-token-test-{}", std::process::id()));
-        std::fs::write(&path, "short").unwrap();
-        assert!(load_rpc_access_token(Some(path.clone())).is_err());
-        let _ = std::fs::remove_file(path);
+    fn zero_rpc_portal_is_resolved_before_listener_binding() {
+        assert_ne!(parse_rpc_portal(Some("0".to_owned())).unwrap().port(), 0);
+    }
+
+    struct RingListener {
+        accepted: mpsc::Receiver<Box<dyn Tunnel>>,
+    }
+
+    impl fmt::Debug for RingListener {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.debug_struct("RingListener").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SocketListener for RingListener {
+        type Accepted = Box<dyn Tunnel>;
+
+        async fn listen(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn accept(&mut self) -> anyhow::Result<Self::Accepted> {
+            self.accepted
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("ring test listener closed"))
+        }
+
+        fn local_url(&self) -> url::Url {
+            "ring://management-test".parse().unwrap()
+        }
     }
 
     #[tokio::test]
-    async fn access_token_rejects_default_domain_client() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let url: url::Url = format!("tcp://127.0.0.1:{port}").parse().unwrap();
-        let manager = Arc::new(NetworkInstanceManager::new());
-        let _server = ApiRpcServer::from_tunnel_with_domain(
-            TcpTunnelListener::new(url.clone()),
-            manager,
-            "private-domain-token",
+    async fn trusted_ring_management_transport_does_not_require_an_ip_host() {
+        let (client_tunnel, server_tunnel) = create_ring_tunnel_pair();
+        let (accepted, receiver) = mpsc::channel(1);
+        accepted.send(server_tunnel).await.unwrap();
+        let server = ApiRpcServer::from_tunnel(
+            RingListener { accepted: receiver },
+            Arc::new(native_instance_manager()),
         )
+        .with_rx_timeout(Some(Duration::from_secs(1)))
         .serve()
         .await
         .unwrap();
+        let client = BidirectRpcManager::new().set_rx_timeout(Some(Duration::from_secs(1)));
+        client.run_with_tunnel(client_tunnel);
+        let logger = client
+            .rpc_client()
+            .scoped_client::<LoggerRpcClientFactory<BaseController>>(1, 1, String::new());
 
-        let mut unauthorized = StandAloneClient::new(TcpTunnelConnector::new(url.clone()));
-        let unauthorized_client = unauthorized
-            .scoped_client::<WebClientServiceClientFactory<BaseController>>(String::new())
-            .await
-            .unwrap();
-        assert!(
-            unauthorized_client
-                .collect_network_info(
-                    BaseController::default(),
-                    CollectNetworkInfoRequest { inst_ids: vec![] },
-                )
-                .await
-                .is_err()
-        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            logger.get_logger_config(BaseController::default(), GetLoggerConfigRequest::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
-        let mut authorized = StandAloneClient::new(TcpTunnelConnector::new(url));
-        let authorized_client = authorized
-            .scoped_client::<WebClientServiceClientFactory<BaseController>>(
-                "private-domain-token".to_string(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            authorized_client
-                .collect_network_info(
-                    BaseController::default(),
-                    CollectNetworkInfoRequest { inst_ids: vec![] },
-                )
-                .await
-                .is_ok()
-        );
+        drop(server);
     }
 }

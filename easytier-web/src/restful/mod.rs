@@ -16,8 +16,7 @@ use axum::{Extension, Json, Router, extract::State, routing::get};
 use axum_login::tower_sessions::{ExpiredDeletion, SessionManagerLayer};
 use axum_login::{AuthManagerLayerBuilder, AuthUser, login_required};
 use axum_messages::MessagesManagerLayer;
-use easytier::common::config::{ConfigLoader, TomlConfigLoader};
-use easytier::launcher::NetworkConfig;
+use easytier::common::config::{ConfigLoader, NetworkConfig, NetworkConfigExt, TomlConfigLoader};
 use easytier::proto::rpc_types;
 use network::NetworkApi;
 use sea_orm::DbErr;
@@ -87,6 +86,10 @@ struct ParseConfigResponse {
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Error {
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_config_revision: Option<String>,
 }
 type RpcError = rpc_types::error::Error;
 type HttpHandleError = (StatusCode, Json<Error>);
@@ -94,6 +97,8 @@ type HttpHandleError = (StatusCode, Json<Error>);
 pub fn other_error<T: ToString>(error_message: T) -> Error {
     Error {
         message: error_message.to_string(),
+        code: None,
+        current_config_revision: None,
     }
 }
 
