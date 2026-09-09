@@ -36,7 +36,9 @@ use super::{
 };
 
 #[cfg(feature = "management")]
-pub use compiled::{register_instance_management_rpc, register_instance_management_rpc_with_domain};
+pub use compiled::{
+    register_instance_management_rpc, register_instance_management_rpc_with_domain,
+};
 pub use config_patch::{ConfigPatchPersistence, apply_config_patch};
 pub use instance_info::network_instance_running_info;
 #[cfg(feature = "management")]
@@ -97,8 +99,16 @@ pub fn register_management_rpc_with_domain<F, H>(
     F::Error: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static,
     H: CoreInstanceHost,
 {
-    register_instance_management_rpc_with_domain(instances.clone(), registry, storage.clone(), domain);
-    registry.register(LoggerRpcServer::new(LoggerManagementRpc::new(logger)), domain);
+    register_instance_management_rpc_with_domain(
+        instances.clone(),
+        registry,
+        storage.clone(),
+        domain,
+    );
+    registry.register(
+        LoggerRpcServer::new(LoggerManagementRpc::new(logger)),
+        domain,
+    );
     registry.register(
         WebClientServiceServer::new(ProcessManagementRpc::<F>::new(instances, hooks, storage)),
         domain,

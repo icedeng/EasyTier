@@ -75,12 +75,19 @@ where
 }
 
 fn load_rpc_access_token(path: Option<PathBuf>) -> anyhow::Result<Option<String>> {
-    let Some(path) = path else { return Ok(None); };
+    let Some(path) = path else {
+        return Ok(None);
+    };
     let token = std::fs::read_to_string(path)
         .context("failed to read rpc access token file")?
         .trim()
         .to_owned();
-    if token.len() < 32 || token.len() > 128 || !token.bytes().all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_')) {
+    if token.len() < 32
+        || token.len() > 128
+        || !token
+            .bytes()
+            .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_'))
+    {
         anyhow::bail!("rpc access token file contains an invalid token");
     }
     Ok(Some(token))
@@ -199,11 +206,31 @@ mod tests {
         },
     };
 
-    use super::{ApiRpcServer, parse_rpc_portal};
+    use super::{ApiRpcServer, load_rpc_access_token, parse_rpc_portal};
 
     #[test]
     fn zero_rpc_portal_is_resolved_before_listener_binding() {
         assert_ne!(parse_rpc_portal(Some("0".to_owned())).unwrap().port(), 0);
+    }
+
+    #[test]
+    fn rpc_access_token_file_requires_a_valid_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+
+        std::fs::write(&path, "a_valid_token_with_32_characters_1234\n").unwrap();
+        assert_eq!(
+            load_rpc_access_token(Some(path.clone()))
+                .unwrap()
+                .as_deref(),
+            Some("a_valid_token_with_32_characters_1234")
+        );
+
+        std::fs::write(&path, "too-short\n").unwrap();
+        assert!(load_rpc_access_token(Some(path.clone())).is_err());
+
+        std::fs::write(&path, "invalid token with spaces and punctuation 123456").unwrap();
+        assert!(load_rpc_access_token(Some(path)).is_err());
     }
 
     struct RingListener {

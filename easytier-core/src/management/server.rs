@@ -18,7 +18,9 @@ use crate::{
 };
 
 #[cfg(feature = "management")]
-use super::{ConfigFileStorage, InstanceMutationHooks, LoggerControl, register_management_rpc_with_domain};
+use super::{
+    ConfigFileStorage, InstanceMutationHooks, LoggerControl, register_management_rpc_with_domain,
+};
 use super::{InstanceManager, ManagementRpcServerHook, register_read_only_management_rpc};
 
 struct ManagementListener<L>
@@ -129,7 +131,14 @@ where
         H: CoreInstanceHost,
     {
         let server = ManagementListener::new(listener, instances.process_runtime());
-        register_management_rpc_with_domain(instances, server.registry(), hooks, storage, logger, domain);
+        register_management_rpc_with_domain(
+            instances,
+            server.registry(),
+            hooks,
+            storage,
+            logger,
+            domain,
+        );
         Self { listener: server }
     }
 

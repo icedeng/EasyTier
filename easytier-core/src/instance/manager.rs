@@ -213,24 +213,43 @@ impl DashboardRuntimeState {
         let configured = self.configured.load(Ordering::Acquire);
         let connected = self.connected.load(Ordering::Acquire);
         let error = self.error.read().ok().and_then(|value| value.clone());
-        let state = if !configured { "DISABLED" } else if connected { "CONNECTED" } else if error.is_some() { "RETRYING" } else { "CONNECTING" };
-        DashboardRuntimeSnapshot { configured, connected, state, error }
+        let state = if !configured {
+            "DISABLED"
+        } else if connected {
+            "CONNECTED"
+        } else if error.is_some() {
+            "RETRYING"
+        } else {
+            "CONNECTING"
+        };
+        DashboardRuntimeSnapshot {
+            configured,
+            connected,
+            state,
+            error,
+        }
     }
 
     fn configure(&self) {
         self.configured.store(true, Ordering::Release);
         self.connected.store(false, Ordering::Release);
-        if let Ok(mut error) = self.error.write() { *error = None; }
+        if let Ok(mut error) = self.error.write() {
+            *error = None;
+        }
     }
 
     fn connected(&self) {
         self.connected.store(true, Ordering::Release);
-        if let Ok(mut error) = self.error.write() { *error = None; }
+        if let Ok(mut error) = self.error.write() {
+            *error = None;
+        }
     }
 
     fn failed(&self, message: &str) {
         self.connected.store(false, Ordering::Release);
-        if let Ok(mut error) = self.error.write() { *error = Some(message.to_owned()); }
+        if let Ok(mut error) = self.error.write() {
+            *error = Some(message.to_owned());
+        }
     }
 }
 
@@ -284,10 +303,18 @@ impl<F: InstanceFactory> InstanceManager<F> {
         }
     }
 
-    pub fn configure_dashboard(&self) { self.dashboard_runtime.configure(); }
-    pub fn mark_dashboard_connected(&self) { self.dashboard_runtime.connected(); }
-    pub fn mark_dashboard_failed(&self, message: &str) { self.dashboard_runtime.failed(message); }
-    pub fn dashboard_runtime_snapshot(&self) -> DashboardRuntimeSnapshot { self.dashboard_runtime.snapshot() }
+    pub fn configure_dashboard(&self) {
+        self.dashboard_runtime.configure();
+    }
+    pub fn mark_dashboard_connected(&self) {
+        self.dashboard_runtime.connected();
+    }
+    pub fn mark_dashboard_failed(&self, message: &str) {
+        self.dashboard_runtime.failed(message);
+    }
+    pub fn dashboard_runtime_snapshot(&self) -> DashboardRuntimeSnapshot {
+        self.dashboard_runtime.snapshot()
+    }
 
     pub fn with_config_path(mut self, config_dir: Option<PathBuf>) -> Self {
         self.config_dir = config_dir;
@@ -592,6 +619,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::config::toml::ConfigLoader;
     struct TestFactory {
         drops: Arc<AtomicUsize>,
     }
@@ -708,5 +736,28 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(snapshot);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dashboard_runtime_snapshot_tracks_configuration_and_failures() {
+        let (manager, _) = manager();
+        assert_eq!(manager.dashboard_runtime_snapshot().state, "DISABLED");
+
+        manager.configure_dashboard();
+        let snapshot = manager.dashboard_runtime_snapshot();
+        assert!(snapshot.configured);
+        assert!(!snapshot.connected);
+        assert_eq!(snapshot.state, "CONNECTING");
+
+        manager.mark_dashboard_failed("connection failed");
+        let snapshot = manager.dashboard_runtime_snapshot();
+        assert_eq!(snapshot.state, "RETRYING");
+        assert_eq!(snapshot.error.as_deref(), Some("connection failed"));
+
+        manager.mark_dashboard_connected();
+        let snapshot = manager.dashboard_runtime_snapshot();
+        assert!(snapshot.connected);
+        assert_eq!(snapshot.state, "CONNECTED");
+        assert!(snapshot.error.is_none());
     }
 }

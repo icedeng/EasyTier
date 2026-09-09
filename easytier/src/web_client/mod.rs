@@ -103,7 +103,9 @@ pub struct MonitorOnlyHooks;
 
 #[async_trait]
 impl WebClientHooks for MonitorOnlyHooks {
-    fn allows_remote_mutations(&self) -> bool { false }
+    fn allows_remote_mutations(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]

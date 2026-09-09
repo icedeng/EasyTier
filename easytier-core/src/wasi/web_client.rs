@@ -269,7 +269,9 @@ impl WebClientBackend for WasiWebClientBackend {
     fn configure_dashboard(&self) {}
     fn mark_dashboard_connected(&self) {}
     fn mark_dashboard_failed(&self, _message: &str) {}
-    fn supports_remote_config(&self) -> bool { true }
+    fn supports_remote_config(&self) -> bool {
+        true
+    }
 }
 
 pub(super) struct WasiWebClientRuntime {

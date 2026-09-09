@@ -70,7 +70,11 @@ pub(in crate::management) fn register_with_domain<F, H>(
 
 #[cfg(feature = "proxy-packet")]
 fn join_domain(prefix: &str, suffix: &str) -> String {
-    if prefix.is_empty() { suffix.to_owned() } else { format!("{prefix}/{suffix}") }
+    if prefix.is_empty() {
+        suffix.to_owned()
+    } else {
+        format!("{prefix}/{suffix}")
+    }
 }
 
 #[cfg(not(feature = "proxy-packet"))]

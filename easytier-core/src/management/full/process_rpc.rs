@@ -33,7 +33,9 @@ use super::{
 
 #[async_trait::async_trait]
 pub trait InstanceMutationHooks: Send + Sync + 'static {
-    fn allows_remote_mutations(&self) -> bool { true }
+    fn allows_remote_mutations(&self) -> bool {
+        true
+    }
 
     fn manages_remote_config_instances(&self) -> bool {
         false
@@ -592,9 +594,17 @@ where
             let instance_id = request
                 .inst_id
                 .map(Into::into)
-                .or_else(|| request.config.as_ref().and_then(|config| config.instance_id.as_deref()).and_then(|id| uuid::Uuid::parse_str(id).ok()))
+                .or_else(|| {
+                    request
+                        .config
+                        .as_ref()
+                        .and_then(|config| config.instance_id.as_deref())
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                })
                 .unwrap_or_else(uuid::Uuid::new_v4);
-            return Ok(RunNetworkInstanceResponse { inst_id: Some(instance_id.into()) });
+            return Ok(RunNetworkInstanceResponse {
+                inst_id: Some(instance_id.into()),
+            });
         }
         let config = request
             .config
@@ -622,7 +632,13 @@ where
     ) -> rpc_types::error::Result<RetainNetworkInstanceResponse> {
         if !self.management.hooks.allows_remote_mutations() {
             return Ok(RetainNetworkInstanceResponse {
-                remain_inst_ids: self.management.instances.instance_ids().into_iter().map(Into::into).collect(),
+                remain_inst_ids: self
+                    .management
+                    .instances
+                    .instance_ids()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
             });
         }
         let retained = request.inst_ids.into_iter().map(Into::into).collect();
@@ -659,12 +675,13 @@ where
             .map(|(id, info)| (id.to_string(), info))
             .filter(|(id, _)| included.is_empty() || included.contains(id))
             .collect();
+        let dashboard = self.management.instances.dashboard_runtime_snapshot();
         Ok(CollectNetworkInfoResponse {
             info: Some(NetworkInstanceRunningInfoMap { map }),
-            dashboard_configured: self.management.instances.dashboard_runtime_snapshot().configured,
-            dashboard_connected: self.management.instances.dashboard_runtime_snapshot().connected,
-            dashboard_state: self.management.instances.dashboard_runtime_snapshot().state.to_owned(),
-            dashboard_error: self.management.instances.dashboard_runtime_snapshot().error,
+            dashboard_configured: dashboard.configured,
+            dashboard_connected: dashboard.connected,
+            dashboard_state: dashboard.state.to_owned(),
+            dashboard_error: dashboard.error,
         })
     }
 
@@ -691,7 +708,13 @@ where
     ) -> rpc_types::error::Result<DeleteNetworkInstanceResponse> {
         if !self.management.hooks.allows_remote_mutations() {
             return Ok(DeleteNetworkInstanceResponse {
-                remain_inst_ids: self.management.instances.instance_ids().into_iter().map(Into::into).collect(),
+                remain_inst_ids: self
+                    .management
+                    .instances
+                    .instance_ids()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
             });
         }
         let requested = request.inst_ids.into_iter().map(Into::into).collect();
@@ -715,7 +738,10 @@ where
         request: GetNetworkInstanceConfigRequest,
     ) -> rpc_types::error::Result<GetNetworkInstanceConfigResponse> {
         if !self.management.hooks.allows_remote_mutations() {
-            return Err(anyhow::anyhow!("raw network configuration is unavailable in monitor-only mode").into());
+            return Err(anyhow::anyhow!(
+                "raw network configuration is unavailable in monitor-only mode"
+            )
+            .into());
         }
         let instance_id = request
             .inst_id

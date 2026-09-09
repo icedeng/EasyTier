@@ -146,10 +146,18 @@ where
         Ok(self.instances.instance_ids())
     }
 
-    fn configure_dashboard(&self) { self.instances.configure_dashboard(); }
-    fn mark_dashboard_connected(&self) { self.instances.mark_dashboard_connected(); }
-    fn mark_dashboard_failed(&self, message: &str) { self.instances.mark_dashboard_failed(message); }
-    fn supports_remote_config(&self) -> bool { self.hooks.allows_remote_mutations() }
+    fn configure_dashboard(&self) {
+        self.instances.configure_dashboard();
+    }
+    fn mark_dashboard_connected(&self) {
+        self.instances.mark_dashboard_connected();
+    }
+    fn mark_dashboard_failed(&self, message: &str) {
+        self.instances.mark_dashboard_failed(message);
+    }
+    fn supports_remote_config(&self) -> bool {
+        self.hooks.allows_remote_mutations()
+    }
 }
 
 struct WebClientController {
@@ -242,7 +250,9 @@ async fn web_client_routine(
         let connection = match connect_config_server(connector.as_ref(), CONNECT_TIMEOUT).await {
             Ok(connection) => connection,
             Err(error) => {
-                controller.backend.mark_dashboard_failed("Dashboard connection failed");
+                controller
+                    .backend
+                    .mark_dashboard_failed("Dashboard connection failed");
                 tracing::warn!(%error, "failed to connect to config server; retrying");
                 time::sleep(RETRY_INTERVAL).await;
                 continue;
@@ -272,7 +282,9 @@ async fn web_client_routine(
                 Ok(connection) => connection,
                 Err(error) => {
                     connected.store(false, Ordering::Release);
-                    controller.backend.mark_dashboard_failed("Dashboard secure reconnect failed");
+                    controller
+                        .backend
+                        .mark_dashboard_failed("Dashboard secure reconnect failed");
                     tracing::warn!(%error, "failed to reconnect secure config-server tunnel");
                     time::sleep(RETRY_INTERVAL).await;
                     continue;
@@ -282,7 +294,9 @@ async fn web_client_routine(
                 Ok(connection) => connection,
                 Err(error) => {
                     connected.store(false, Ordering::Release);
-                    controller.backend.mark_dashboard_failed("Dashboard secure handshake failed");
+                    controller
+                        .backend
+                        .mark_dashboard_failed("Dashboard secure handshake failed");
                     tracing::warn!(%error, "config-server secure handshake failed");
                     time::sleep(RETRY_INTERVAL).await;
                     continue;
@@ -292,14 +306,18 @@ async fn web_client_routine(
             session.start_heartbeat().await;
             session.wait().await;
             connected.store(false, Ordering::Release);
-            controller.backend.mark_dashboard_failed("Dashboard connection interrupted");
+            controller
+                .backend
+                .mark_dashboard_failed("Dashboard connection interrupted");
             continue;
         }
 
         if support_encryption {
             if controller.config.secure_mode {
                 connected.store(false, Ordering::Release);
-                controller.backend.mark_dashboard_failed("Dashboard secure tunnel is unavailable");
+                controller
+                    .backend
+                    .mark_dashboard_failed("Dashboard secure tunnel is unavailable");
                 tracing::warn!("secure mode requires web secure-tunnel support in the local build");
                 time::sleep(RETRY_INTERVAL).await;
                 continue;
@@ -310,7 +328,9 @@ async fn web_client_routine(
         }
         if controller.config.secure_mode {
             connected.store(false, Ordering::Release);
-            controller.backend.mark_dashboard_failed("Dashboard does not support secure tunnel");
+            controller
+                .backend
+                .mark_dashboard_failed("Dashboard does not support secure tunnel");
             tracing::warn!("secure mode requires config-server encryption support");
             time::sleep(RETRY_INTERVAL).await;
             continue;
@@ -319,7 +339,9 @@ async fn web_client_routine(
         session.start_heartbeat().await;
         session.wait().await;
         connected.store(false, Ordering::Release);
-        controller.backend.mark_dashboard_failed("Dashboard connection interrupted");
+        controller
+            .backend
+            .mark_dashboard_failed("Dashboard connection interrupted");
     }
 }
 

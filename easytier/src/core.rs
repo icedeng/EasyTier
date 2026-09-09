@@ -1511,7 +1511,9 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
     if let Some(path) = cli.config_server_file.as_ref() {
         let value = std::fs::read_to_string(path).context("failed to read config server file")?;
         let value = value.trim();
-        if value.is_empty() { anyhow::bail!("config server file is empty"); }
+        if value.is_empty() {
+            anyhow::bail!("config server file is empty");
+        }
         cli.config_server = Some(value.to_owned());
     }
 
@@ -1527,7 +1529,10 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
     .await?;
 
     let _web_client = if let Some(config_server_url_s) = cli.config_server.as_ref() {
-        let hooks = cli.web_client_monitor_only.then(|| Arc::new(web_client::MonitorOnlyHooks) as Arc<dyn web_client::WebClientHooks>);
+        manager.configure_dashboard();
+        let hooks = cli
+            .web_client_monitor_only
+            .then(|| Arc::new(web_client::MonitorOnlyHooks) as Arc<dyn web_client::WebClientHooks>);
         let wc = web_client::run_web_client(
             config_server_url_s,
             crate::common::MachineIdOptions {
@@ -1544,7 +1549,10 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
             Ok(wc) => Some(wc),
             Err(error) => {
                 manager.mark_dashboard_failed("Dashboard client initialization failed");
-                log::warn!(?error, "Dashboard client initialization failed; data plane will continue");
+                log::warn!(
+                    ?error,
+                    "Dashboard client initialization failed; data plane will continue"
+                );
                 None
             }
         }
